@@ -68,7 +68,7 @@ function App() {
         <p>{signInMsg}</p>
       </div>
       <div>
-        <button onClick={onPutFileBtnClick}>Put arbitraly file</button>
+        <button onClick={onPutFileBtnClick}>Put arbitrary file</button>
         <button onClick={onDeleteAllBtnClick}>Delete all</button>
       </div>
     </div>
