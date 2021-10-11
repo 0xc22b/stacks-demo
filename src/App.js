@@ -1,18 +1,27 @@
 import React, { useState, useEffect } from 'react';
-
-import {
-  DEFAULT_PROFILE, makeDIDFromAddress, UserSession, AppConfig,
-} from '@stacks/auth'
+import { SECP256K1Client } from 'jsontokens';
+import { makeDIDFromAddress, UserSession, AppConfig } from '@stacks/auth'
 import { Storage } from '@stacks/storage';
-import keychain, { decrypt } from '@stacks/keychain';
-import { makeGaiaAssociationToken } from '@stacks/keychain/dist/utils/gaia';
-import { ChainID } from '@stacks/transactions';
-import { getPublicKeyFromPrivate } from '@stacks/encryption';
-import { BLOCKSTACK_DEFAULT_GAIA_HUB_URL, Buffer } from '@stacks/common';
+import {
+  generateSecretKey, generateWallet, restoreWalletAccounts, decrypt, getAppPrivateKey,
+  getStxAddress, createWalletGaiaConfig, getOrCreateWalletConfig,
+  updateWalletConfigWithApp,
+} from '@stacks/wallet-sdk/dist';
+import {
+  DEFAULT_PROFILE, fetchAccountProfile,
+} from '@stacks/wallet-sdk/dist/models/profile';
+import { TransactionVersion } from '@stacks/transactions';
+import { makeGaiaAssociationToken } from '@stacks/wallet-sdk/dist/utils';
+import { getPublicKeyFromPrivate, publicKeyToAddress } from '@stacks/encryption';
+import { fetchPrivate } from '@stacks/common';
 
 import './App.css';
 
 const DEFAULT_PASSWORD = 'password';
+const DEFAULT_GAIA_HUB_URL = 'https://hub.blockstack.org';
+const DEFAULT_GAIA_HUB_READ_URL = 'https://gaia.blockstack.org/hub/';
+
+//const VERSION = '1.3.1';
 
 //const APP_NAME = 'Stacks demo';
 //const APP_URL = 'https://192.168.1.43:3000';
@@ -24,13 +33,15 @@ const APP_SCOPES = ['store_write'];
 const appConfig = new AppConfig(APP_SCOPES, APP_URL);
 const userSession = new UserSession({ appConfig });
 
-const doUseWithOtherApps = (wallet) => {
+const doUseWithOtherApps = (walletConfig) => {
   try {
-    if (wallet.walletConfig && !wallet.walletConfig.hideWarningForReusingIdentity) {
-      for (const identity of wallet.walletConfig.identities) {
-        for (const k in identity.apps) {
-          if (k !== APP_URL) return true;
-        }
+    if (walletConfig.meta && walletConfig.meta.hideWarningForReusingIdentity) {
+      return false;
+    }
+
+    for (const account of walletConfig.accounts) {
+      for (const k in account.apps) {
+        if (k !== APP_URL) return true;
       }
     }
   } catch (e) {
@@ -40,23 +51,21 @@ const doUseWithOtherApps = (wallet) => {
   return false;
 };
 
-const _doUseBefore = (identity) => {
-  for (const k in identity.apps) {
+const _doUseBefore = (account) => {
+  for (const k in account.apps) {
     if (k === APP_URL) return true;
   }
   return false;
 };
 
-const doUseBefore = (wallet, identityIndex = null) => {
+const doUseBefore = (walletConfig, accountIndex = null) => {
   try {
-    if (wallet.walletConfig) {
-      if (identityIndex) {
-        const identity = wallet.walletConfig.identities[identityIndex];
-        if (_doUseBefore(identity)) return true;
-      } else {
-        for (const identity of wallet.walletConfig.identities) {
-          if (_doUseBefore(identity)) return true;
-        }
+    if (accountIndex) {
+      const account = walletConfig.accounts[accountIndex];
+      if (_doUseBefore(account)) return true;
+    } else {
+      for (const account of walletConfig.accounts) {
+        if (_doUseBefore(account)) return true;
       }
     }
   } catch (e) {
@@ -68,100 +77,148 @@ const doUseBefore = (wallet, identityIndex = null) => {
 
 function App() {
   const [wallet, setWallet] = useState(null);
-  const [backupPhrase, setBackupPhrase] = useState('');
-  const [backupPhraseInput, setBackupPhraseInput] = useState('');
+  const [walletConfig, setWalletConfig] = useState(null);
+  const [gaiaConfig, setGaiaConfig] = useState(null);
+  const [secretKey, setSecretKey] = useState('');
+  const [secretKeyInput, setSecretKeyInput] = useState('');
 
   const onSignUpBtnClick = async () => {
     if (wallet) return;
 
-    const w = await keychain.Wallet.generate(DEFAULT_PASSWORD, ChainID.Mainnet);
+    const secretKey = generateSecretKey(128);
+    const w = await generateWallet({ secretKey, password: DEFAULT_PASSWORD });
+    console.log('w: ', w);
     setWallet(w);
 
-    const encryptedBackupPhrase = wallet.encryptedBackupPhrase;
-    const plainTextBuffer = await decrypt(Buffer.from(encryptedBackupPhrase, 'hex'), DEFAULT_PASSWORD);
-    const phrase = plainTextBuffer.toString();
-    setBackupPhrase(phrase);
+    const backupSecretKey = await decrypt(w.encryptedSecretKey, DEFAULT_PASSWORD);
+    console.log('secretKey and its backup equals: ', secretKey === backupSecretKey);
+    setSecretKey(backupSecretKey);
   };
 
   const onSignInBtnClick = async () => {
-    if (wallet) return;
+    if (wallet) {
+      console.log('Wallet is already available.');
+      return;
+    }
 
     try {
-      const w = await keychain.Wallet.restore(DEFAULT_PASSWORD, backupPhraseInput, ChainID.Mainnet);
+      const baseWallet = await generateWallet(
+        { secretKey: secretKeyInput, password: DEFAULT_PASSWORD }
+      );
+      const w = await restoreWalletAccounts({
+        wallet: baseWallet,
+        gaiaHubUrl: DEFAULT_GAIA_HUB_URL,
+      });
+      console.log('w: ', w);
+
+      let didUpdate = false;
+      for (const account of w.accounts) {
+        if (!account.username) {
+          const stxAddress = getStxAddress({
+            account, transactionVersion: TransactionVersion.Mainnet,
+          });
+          const nameUrl = `https://stacks-node-api.mainnet.stacks.co/v1/addresses/stacks/${stxAddress}`;
+          const res = await fetchPrivate(nameUrl);
+          if (res.ok) {
+            const json = await res.json();
+            if (Array.isArray(json.names) && json.names.length > 0) {
+              account.username = json.names[0];
+              didUpdate = true;
+            }
+          }
+        }
+
+        const profile = await fetchAccountProfile({
+          account, gaiaHubUrl: DEFAULT_GAIA_HUB_READ_URL
+        });
+        if (profile) account.profile = profile;
+      }
+      if (didUpdate) console.log('Need to update wallet config again!');
+
+      const gConfig = await createWalletGaiaConfig({
+        gaiaHubUrl: DEFAULT_GAIA_HUB_URL, wallet: w
+      });
+      const wConfig = await getOrCreateWalletConfig({
+        wallet: w, gaiaHubConfig: gConfig, skipUpload: true,
+      });
 
       // Check if use this wallet with other apps
       // As directly enter backup phrase, for security, don't reuse backup phrase
-      if (doUseWithOtherApps(w) && !doUseBefore(w)) {
+      if (doUseWithOtherApps(wConfig) && !doUseBefore(wConfig)) {
         console.log('WARNING: use this wallet with other apps.');
       }
 
       setWallet(w);
-      setBackupPhraseInput('');
+      setWalletConfig(wConfig);
+      setGaiaConfig(gConfig);
+      setSecretKeyInput('');
     } catch (e) {
       console.log(e);
     }
   };
 
   const onAppSignInBtnClick = async () => {
-    const identityIndex = 0;
-    const currentIdentity = wallet.identities[identityIndex];
-    await currentIdentity.refresh();
+    if (!wallet) {
+      console.log('No wallet to be used for app sign in.');
+      return;
+    }
 
-    // Use wallet-config.json in hub.blockstack.org to restore a wallet for convenience
-    // ref: @stacks/keychain/src/wallet:restore
-    if (!doUseBefore(wallet, identityIndex)) {
-      const gaiaConfig = await wallet.createGaiaConfig(BLOCKSTACK_DEFAULT_GAIA_HUB_URL);
-      await wallet.getOrCreateConfig({ gaiaConfig, skipUpload: true });
-      await wallet.updateConfigWithAuth({
-        identityIndex,
-        gaiaConfig,
+    const accountIndex = 0;
+    const account = wallet.accounts[accountIndex];
+
+    /*const profileUrl = await fetchAccountProfileUrl({
+      account, gaiaHubUrl: DEFAULT_GAIA_HUB_READ_URL,
+    });
+    const profile = await fetchProfileFromUrl(profileUrl);*/
+    const profile = account.profile;
+
+    if (!doUseBefore(walletConfig, accountIndex)) {
+      await updateWalletConfigWithApp({
+        wallet,
+        account,
         app: {
           origin: APP_URL,
-          lastLoginAt: new Date().getTime(),
           scopes: APP_SCOPES,
+          lastLoginAt: new Date().getTime(),
           appIcon: APP_ICON_URL,
           name: APP_NAME,
         },
+        gaiaHubConfig: gaiaConfig,
+        walletConfig,
       });
     }
 
-    let gaiaUrl = BLOCKSTACK_DEFAULT_GAIA_HUB_URL;
-    if (currentIdentity.profile && currentIdentity.profile.api && currentIdentity.profile.api.gaiaHubUrl) {
-      gaiaUrl = currentIdentity.profile.api.gaiaHubUrl;
+    let gaiaUrl = DEFAULT_GAIA_HUB_URL;
+    if (profile && profile.api && profile.api.gaiaHubUrl) {
+      gaiaUrl = profile.api.gaiaHubUrl;
     }
 
-    const address = currentIdentity.keyPair.address;
+    const publicKey = SECP256K1Client.derivePublicKey(account.dataPrivateKey);
+    const address = publicKeyToAddress(publicKey);
     const did = makeDIDFromAddress(address);
 
-    //const _publicKey = SECP256K1Client.derivePublicKey(currentIdentity.keyPair.key);
-    //const _address = publicKeyToAddress(_publicKey);
-    //console.log('address: ', address, '_address: ', _address);
-
-    /*const stxAddress = wallet.stacksPrivateKey
-      ? wallet.getSigner().getSTXAddress(TransactionVersion.Mainnet)
-      : undefined;*/
-    const stxAddress = '';
-    const appPrivateKey = currentIdentity.appPrivateKey(APP_URL);
-
-    //const hubInfo = await getHubInfo(gaiaUrl);
-    //const profileUrl = await currentIdentity.profileUrl(hubInfo.read_url_prefix);
-    //const profile = (await fetchProfile({ identity: currentIdentity, gaiaUrl: hubInfo.read_url_prefix })) || DEFAULT_PROFILE;
+    const appPrivateKey = getAppPrivateKey({ account, appDomain: APP_URL });
 
     const compressedAppPublicKey = getPublicKeyFromPrivate(appPrivateKey.slice(0, 64));
-    const associationToken = makeGaiaAssociationToken(currentIdentity.keyPair.key, compressedAppPublicKey);
+    const associationToken = makeGaiaAssociationToken({
+      privateKey: account.dataPrivateKey,
+      childPublicKeyHex: compressedAppPublicKey,
+    });
 
     const userData = {
-      'username': currentIdentity.defaultUsername || '',
-      'profile': { ...(currentIdentity.profile || DEFAULT_PROFILE), stxAddress },
-      'email': null,
-      'decentralizedID': did,
-      'identityAddress': address,
-      'appPrivateKey': appPrivateKey,
-      'coreSessionToken': null,
-      'authResponseToken': null,
-      'hubUrl': gaiaUrl,
-      'coreNode': null,
-      'gaiaAssociationToken': associationToken,
+      username: account.username || '',
+      email: null,
+      profile: { ...(profile || DEFAULT_PROFILE), stxAddress: {} },
+      //profile_url: profile ? profileUrl : null,
+      decentralizedID: did,
+      identityAddress: address,
+      appPrivateKey: appPrivateKey,
+      coreSessionToken: null,
+      authResponseToken: null,
+      hubUrl: gaiaUrl,
+      coreNode: null,
+      gaiaAssociationToken: associationToken,
+      //version: VERSION,
       // gaiaConfig below is created with wallet private key, not app private key
       // this will be created later by @stacks/storage
       //'gaiaHubConfig': gaiaConfig,
@@ -210,10 +267,10 @@ function App() {
 
   const onSignOutBtnClick = async () => {
     setWallet(null);
-    setBackupPhrase('');
+    setSecretKey('');
   };
 
-  const onBackupPhraseInputChange = (e) => setBackupPhraseInput(e.target.value);
+  const onSecretKeyInputChange = (e) => setSecretKeyInput(e.target.value);
 
   useEffect(() => {
 
@@ -223,10 +280,10 @@ function App() {
     <div className="App">
       <div>
         <button onClick={onSignUpBtnClick}>Sign up</button>
-        <p>{backupPhrase}</p>
+        <p>{secretKey}</p>
       </div>
       <div>
-        <input onChange={onBackupPhraseInputChange} type="text" placeholder="Enter backup phrase" value={backupPhraseInput} />
+        <input onChange={onSecretKeyInputChange} type="text" placeholder="Enter backup phrase" value={secretKeyInput} />
         <button onClick={onSignInBtnClick}>Sign in</button>
         <p></p>
       </div>
