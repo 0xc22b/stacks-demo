@@ -2,11 +2,12 @@
   "compilerOptions": {
     "allowJs": true,
     "checkJs": true,
-    "target": "es6",
-    "allowSyntheticDefaultImports": true,
+    "target": "esnext",
+    "module": "nodenext",
     "moduleResolution": "node",
+    "allowSyntheticDefaultImports": true,
+    "jsx": "preserve",
     "noEmit": true,
-    "jsx": "react",
     "typeRoots": ["./src/@types", "./node_modules/@types"]
   }
 }
